@@ -52,7 +52,7 @@ build_in_docker() {
             apt-get update -qq 2>/dev/null
             apt-get install -y -qq libpcap-dev 2>/dev/null
             cd /src
-            CGO_ENABLED=1 GOOS=linux GOARCH=${arch} go build -trimpath -ldflags=\"-s -w -X paqet/cmd/version.Version=${VERSION} -X paqet/cmd/version.GitCommit=${GIT_COMMIT} -X paqet/cmd/version.GitTag=${GIT_TAG} -X paqet/cmd/version.BuildTime=\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" -o /out/recoba-tunnel ./cmd
+            CGO_ENABLED=1 GODEBUG=asyncpreemptoff=1 GOOS=linux GOARCH=${arch} go build -trimpath -ldflags=\"-s -w -X paqet/cmd/version.Version=${VERSION} -X paqet/cmd/version.GitCommit=${GIT_COMMIT} -X paqet/cmd/version.GitTag=${GIT_TAG} -X paqet/cmd/version.BuildTime=\$(date -u +%Y-%m-%dT%H:%M:%SZ)\" -o /out/recoba-tunnel ./cmd
         "
 
     cd "$BUILD_DIR"
