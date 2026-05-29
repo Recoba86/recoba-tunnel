@@ -14,13 +14,19 @@ type Client struct {
 	iter    *iterator.Iterator[*timedConn]
 	udpPool *udpPool
 	mu      sync.Mutex
+
+	// Testing hooks
+	newStrmOverride func() (tnet.Strm, error)
 }
 
 func New(cfg *conf.Conf) (*Client, error) {
 	c := &Client{
 		cfg:     cfg,
 		iter:    &iterator.Iterator[*timedConn]{},
-		udpPool: &udpPool{strms: make(map[uint64]tnet.Strm)},
+		udpPool: &udpPool{
+			strms:   make(map[uint64]tnet.Strm),
+			pending: make(map[uint64]chan struct{}),
+		},
 	}
 	return c, nil
 }

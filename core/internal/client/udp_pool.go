@@ -7,8 +7,9 @@ import (
 )
 
 type udpPool struct {
-	strms map[uint64]tnet.Strm
-	mu    sync.RWMutex
+	strms   map[uint64]tnet.Strm
+	pending map[uint64]chan struct{}
+	mu      sync.RWMutex
 }
 
 func (p *udpPool) delete(key uint64) error {

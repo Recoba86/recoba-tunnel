@@ -9,13 +9,27 @@ import (
 
 func (c *Client) UDP(lAddr, tAddr string) (tnet.Strm, bool, uint64, error) {
 	key := hash.AddrPair(lAddr, tAddr)
-	c.udpPool.mu.RLock()
+	c.udpPool.mu.Lock()
 	if strm, exists := c.udpPool.strms[key]; exists {
-		c.udpPool.mu.RUnlock()
+		c.udpPool.mu.Unlock()
 		flog.Debugf("reusing UDP stream %d for %s -> %s", strm.SID(), lAddr, tAddr)
 		return strm, false, key, nil
 	}
-	c.udpPool.mu.RUnlock()
+	if ch, pending := c.udpPool.pending[key]; pending {
+		c.udpPool.mu.Unlock()
+		<-ch
+		return c.UDP(lAddr, tAddr)
+	}
+	ch := make(chan struct{})
+	c.udpPool.pending[key] = ch
+	c.udpPool.mu.Unlock()
+
+	defer func() {
+		c.udpPool.mu.Lock()
+		delete(c.udpPool.pending, key)
+		close(ch)
+		c.udpPool.mu.Unlock()
+	}()
 
 	strm, err := c.newStrm()
 	if err != nil {

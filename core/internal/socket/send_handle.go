@@ -25,8 +25,13 @@ type TCPF struct {
 	mu         sync.RWMutex
 }
 
+type PcapHandle interface {
+	WritePacketData(data []byte) error
+	Close()
+}
+
 type SendHandle struct {
-	handle      *pcap.Handle
+	handle      PcapHandle
 	tx          conf.TX
 	pacer       *txPacer
 	srcIPv4     net.IP
@@ -297,15 +302,23 @@ func (h *SendHandle) writePacketData(data []byte) error {
 	if retries < 0 {
 		retries = 0
 	}
+	if retries > 2 {
+		retries = 2
+	}
 	baseDelay := time.Duration(h.tx.RawPacketRetryUS) * time.Microsecond
 	if baseDelay < 0 {
 		baseDelay = 0
 	}
+	maxDelay := 1000 * time.Microsecond
 
 	for attempt := 1; attempt <= retries; attempt++ {
 		atomic.AddUint64(&h.metrics.retryTotal, 1)
-		if baseDelay > 0 {
-			time.Sleep(baseDelay << (attempt - 1))
+		delay := baseDelay << (attempt - 1)
+		if delay > maxDelay {
+			delay = maxDelay
+		}
+		if delay > 0 {
+			time.Sleep(delay)
 		}
 		if h.pacer != nil {
 			h.pacer.wait(len(data))
