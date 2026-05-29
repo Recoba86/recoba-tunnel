@@ -37,6 +37,7 @@ assert_contains() {
 tmp_dir="$(mktemp -d)"
 cleanup() {
     rm -rf "$tmp_dir"
+    rm -f missing_bin.yaml inactive.yaml panic.yaml retry_failed.yaml enobufs.yaml conn_lost.yaml ok.yaml
 }
 trap cleanup EXIT
 
@@ -108,7 +109,7 @@ journalctl() {
     elif [[ "$*" == *"enobufs.service"* ]]; then
         echo "write udp: ENOBUFS"
     elif [[ "$*" == *"conn_lost.service"* ]]; then
-        echo "connection lost"
+        echo -e "connection lost\nconnection lost\nconnection lost"
     else
         echo "normal log"
     fi
@@ -303,5 +304,152 @@ if [[ "$backup_filename" == *"Version:"* || "$backup_filename" == *" "* ]]; then
     exit 1
 fi
 pass_count=$((pass_count + 1))
+
+# ---------------------------------------------------------
+# Test: v2.1.2 Upgraded Time-Aware Health Check
+# ---------------------------------------------------------
+
+# Define mock environment variables
+MOCK_ACTIVE_ENTER="Sat 2026-05-30 01:00:00 +0330"
+MOCK_MAIN_PID="2222"
+MOCK_PS_LSTART="Sat May 30 01:00:00 2026"
+MOCK_RUNTIME_LOGS=""
+MOCK_BOOT_LOGS=""
+MOCK_TAIL_LOGS=""
+MOCK_RUNTIME_FAIL="false"
+MOCK_BOOT_FAIL="false"
+
+# Redefine systemctl mock
+systemctl() {
+    local cmd="$1"
+    
+    if [ "$cmd" = "show" ]; then
+        if [[ "$*" == *"ActiveEnterTimestamp"* ]]; then
+            echo "ActiveEnterTimestamp=$MOCK_ACTIVE_ENTER"
+        elif [[ "$*" == *"MainPID"* ]]; then
+            echo "MainPID=$MOCK_MAIN_PID"
+        elif [[ "$*" == *"NRestarts"* ]]; then
+            echo "NRestarts=0"
+        fi
+        return 0
+    elif [ "$cmd" = "is-active" ]; then
+        return 0
+    elif [ "$cmd" = "cat" ]; then
+        echo "ExecStart=$tmp_dir/opt/recoba-tunnel"
+        return 0
+    fi
+}
+export -f systemctl
+
+# Redefine ps mock
+ps() {
+    if [[ "$*" == *"lstart"* ]]; then
+        echo "$MOCK_PS_LSTART"
+    elif [[ "$*" == *"rss"* ]]; then
+        echo "45000"
+    fi
+}
+export -f ps
+
+# Redefine journalctl mock
+journalctl() {
+    if [[ "$*" == *"--since"* ]]; then
+        if [ "$MOCK_RUNTIME_FAIL" = "true" ]; then
+            return 1
+        fi
+        echo -e "$MOCK_RUNTIME_LOGS"
+        return 0
+    elif [[ "$*" == *"-b"* ]]; then
+        if [ "$MOCK_BOOT_FAIL" = "true" ]; then
+            return 1
+        fi
+        echo -e "$MOCK_BOOT_LOGS"
+        return 0
+    elif [[ "$*" == *"-n 300"* ]]; then
+        echo -e "$MOCK_TAIL_LOGS"
+        return 0
+    fi
+    echo "normal log"
+    return 0
+}
+export -f journalctl
+
+# Redefine ss mock to bound port 1090
+ss() {
+    echo "LISTEN 0 128 0.0.0.0:1090 0.0.0.0:* users:((\"recoba-tunnel\",pid=2222,fd=3))"
+}
+export -f ss
+
+# Verify initial baseline (OK [runtime])
+MOCK_RUNTIME_LOGS=""
+MOCK_BOOT_LOGS="connection lost" # historical logs exist, but runtime is clean
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "OK" "v2.1.2: clean runtime logs -> OK"
+assert_contains "$out" "[runtime]" "v2.1.2: clean runtime log window type"
+
+# Test 1: Historical logs ignored (connection_lost exists in boot logs, but runtime logs are clean)
+MOCK_RUNTIME_LOGS=""
+MOCK_BOOT_LOGS="connection lost\nconnection lost\nconnection lost"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "OK" "v2.1.2: historical logs ignored"
+assert_contains "$out" "[runtime]" "v2.1.2: verified runtime window type"
+
+# Test 2: Runtime connection_lost >= 3 => WARN
+MOCK_RUNTIME_LOGS="connection lost\nconnection lost\nconnection lost"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "WARN" "v2.1.2: runtime connection_lost >= 3 -> WARN"
+assert_contains "$out" "connection_lost (3)" "v2.1.2: flapping connection warn reason"
+
+# Test 3: Runtime connection_lost < 3 => OK
+MOCK_RUNTIME_LOGS="connection lost\nconnection lost"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "OK" "v2.1.2: runtime connection_lost < 3 -> OK"
+
+# Test 4: Runtime retry_failed => FAIL
+MOCK_RUNTIME_LOGS="retry_failed"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "FAIL" "v2.1.2: runtime retry_failed -> FAIL"
+
+# Test 5: Runtime panic => FAIL
+MOCK_RUNTIME_LOGS="panic: test panic"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "FAIL" "v2.1.2: runtime panic -> FAIL"
+
+# Test 6: ActiveEnterTimestamp unavailable -> boot fallback
+MOCK_ACTIVE_ENTER="no"
+MOCK_BOOT_LOGS="connection lost" # returns warn if >=3, under 3 is OK
+MOCK_RUNTIME_LOGS=""
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "[boot]" "v2.1.2: ActiveEnterTimestamp unavailable -> boot fallback"
+
+# Test 7: Runtime window empty -> OK [runtime]
+MOCK_ACTIVE_ENTER="Sat 2026-05-30 01:00:00 +0330"
+MOCK_RUNTIME_LOGS="" # explicitly empty
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "OK" "v2.1.2: runtime window empty -> OK"
+assert_contains "$out" "[runtime]" "v2.1.2: runtime window empty window type"
+
+# Test 8: Boot fallback path
+MOCK_ACTIVE_ENTER="no"
+MOCK_BOOT_FAIL="false"
+MOCK_BOOT_LOGS="clean logs"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "[boot]" "v2.1.2: boot fallback window type"
+
+# Test 9: Tail300 fallback path (both runtime and boot fail/empty)
+MOCK_ACTIVE_ENTER="no"
+MOCK_BOOT_FAIL="true"
+MOCK_TAIL_LOGS="tail logs"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "[tail300]" "v2.1.2: tail300 fallback window type"
+
+# Test 10: Timestamp mismatch (>10s) triggers fallback, but does NOT generate WARN
+MOCK_ACTIVE_ENTER="Sat 2026-05-30 01:00:00 +0330" # Epoch: 1780132200
+MOCK_PS_LSTART="Sat May 30 01:05:00 2026" # Epoch: 1780132500 (300s difference!)
+MOCK_BOOT_FAIL="false"
+MOCK_BOOT_LOGS="clean boot logs"
+out=$(health_check_tunnel "ok.yaml")
+assert_contains "$out" "OK" "v2.1.2: timestamp mismatch does NOT generate WARN"
+assert_contains "$out" "[boot]" "v2.1.2: timestamp mismatch triggers fallback to boot"
 
 printf 'All operational features tests passed (%s assertions).\n' "$pass_count"

@@ -16,7 +16,7 @@ PROJECT_NAME="Recoba Tunnel"
 INSTALLER_VERSION="2.0.0"
 GITHUB_REPO="Recoba86/recoba-tunnel"
 INSTALLER_REPO="$GITHUB_REPO"
-RELEASE_TAG="v2.1.0"
+RELEASE_TAG="v2.1.2"
 INSTALLER_CMD="/usr/local/bin/recoba-tunnel"
 
 # --- Paths ---
@@ -3104,6 +3104,31 @@ get_active_binary_path() {
     echo "$bin_path"
 }
 
+parse_timestamp_to_epoch() {
+    local ts="$1"
+    [ -z "$ts" ] && return 1
+    
+    # 1. Try GNU date
+    local epoch=""
+    epoch=$(date -d "$ts" +%s 2>/dev/null)
+    if [ -n "$epoch" ]; then
+        echo "$epoch"
+        return 0
+    fi
+    
+    # 2. Try BSD date formats (macOS support)
+    epoch=$(date -j -f "%a %Y-%m-%d %H:%M:%S %z" "$ts" +%s 2>/dev/null)
+    [ -z "$epoch" ] && epoch=$(date -j -f "%a %Y-%m-%d %H:%M:%S %Z" "$ts" +%s 2>/dev/null)
+    [ -z "$epoch" ] && epoch=$(date -j -f "%a %b %d %H:%M:%S %Y" "$ts" +%s 2>/dev/null)
+    
+    if [ -n "$epoch" ]; then
+        echo "$epoch"
+        return 0
+    fi
+    
+    return 1
+}
+
 health_check_tunnel() {
     local config_file="$1"
     local name
@@ -3147,16 +3172,81 @@ health_check_tunnel() {
         fi
     fi
 
+    local timestamps_valid=false
+    local sys_ts=""
+    local sys_epoch=""
+    local ps_epoch=""
+    
+    local pid=""
+    pid=$(systemctl show -p MainPID "$service" 2>/dev/null | cut -d= -f2)
+
+    # 1. Fetch systemctl show -p ActiveEnterTimestamp
+    sys_ts=$(systemctl show -p ActiveEnterTimestamp "$service" 2>/dev/null | cut -d= -f2)
+    if [ -n "$sys_ts" ] && [ "$sys_ts" != "no" ]; then
+        sys_epoch=$(parse_timestamp_to_epoch "$sys_ts")
+    fi
+
+    # 2. Fetch ps lstart
+    if [ -n "$pid" ] && [ "$pid" -gt 0 ]; then
+        local ps_ts=""
+        ps_ts=$(ps -o lstart= -p "$pid" 2>/dev/null)
+        if [ -n "$ps_ts" ]; then
+            ps_epoch=$(parse_timestamp_to_epoch "$ps_ts")
+        fi
+    fi
+
+    # 3. Check for mismatch (allow up to 10 seconds difference)
+    if [ -n "$sys_epoch" ] && [ -n "$ps_epoch" ]; then
+        local diff=$((sys_epoch - ps_epoch))
+        diff=${diff#-} # absolute value
+        if [ "$diff" -le 10 ]; then
+            timestamps_valid=true
+        fi
+    fi
+
+    local logs=""
+    local window_type=""
+
+    # --- Priority 1: Current Runtime ---
+    if [ "$timestamps_valid" = true ] && [ "$status" = "OK" ]; then
+        local raw_logs
+        raw_logs=$(journalctl -u "$service" --since "$sys_ts" --no-pager 2>/dev/null)
+        local q_status=$?
+        if [ $q_status -eq 0 ]; then
+            window_type="runtime"
+            logs=$(echo "$raw_logs" | grep -v "metrics initialized:" || true)
+        fi
+    fi
+
+    # --- Priority 2: Current Boot Session ---
+    if [ -z "$window_type" ] && [ "$status" = "OK" ]; then
+        local raw_logs
+        raw_logs=$(journalctl -u "$service" -b --no-pager 2>/dev/null)
+        local q_status_b=$?
+        if [ $q_status_b -eq 0 ]; then
+            window_type="boot"
+            logs=$(echo "$raw_logs" | grep -v "metrics initialized:" || true)
+        fi
+    fi
+
+    # --- Priority 3: Fixed Tail (Safest Fallback) ---
+    if [ -z "$window_type" ] && [ "$status" = "OK" ]; then
+        local raw_logs
+        raw_logs=$(journalctl -u "$service" -n 300 --no-pager 2>/dev/null)
+        local q_status_t=$?
+        if [ $q_status_t -eq 0 ]; then
+            window_type="tail300"
+            logs=$(echo "$raw_logs" | grep -v "metrics initialized:" || true)
+        fi
+    fi
+
     local panic_cnt=0
     local retry_failed_cnt=0
     local msg_large_cnt=0
     local conn_lost_cnt=0
     local enobufs_cnt=0
 
-    if [ "$status" = "OK" ] || [ "$status" = "WARN" ]; then
-        local logs
-        logs=$(journalctl -u "$service" -n 100 --no-pager 2>/dev/null | grep -v "metrics initialized:" || true)
-
+    if [ -n "$window_type" ] && [ "$status" = "OK" ] && [ -n "$logs" ]; then
         panic_cnt=$(echo "$logs" | grep -i "panic" -c || true)
         retry_failed_cnt=$(echo "$logs" | grep -i "retry_failed" -c || true)
         msg_large_cnt=$(echo "$logs" | grep -i "Message too large" -c || true)
@@ -3172,13 +3262,10 @@ health_check_tunnel() {
         elif [ "$retry_failed_cnt" -gt 0 ]; then
             status="FAIL"
             reason="retry_failed > 0 ($retry_failed_cnt)"
-        elif [ "$conn_lost_cnt" -gt 5 ]; then
-            status="WARN"
-            reason="high connection_lost ($conn_lost_cnt)"
-        elif [ "$conn_lost_cnt" -gt 0 ]; then
+        elif [ "$conn_lost_cnt" -ge 3 ]; then
             status="WARN"
             reason="connection_lost ($conn_lost_cnt)"
-        elif [ "$enobufs_cnt" -gt 0 ]; then
+        elif [ "$enobufs_cnt" -gt 0 ] && [ "$retry_failed_cnt" -eq 0 ]; then
             status="WARN"
             reason="ENOBUFS recovered"
         fi
@@ -3187,8 +3274,6 @@ health_check_tunnel() {
     local mem_rss=0
     local restarts=0
     if [ "$status" != "FAIL" ]; then
-        local pid
-        pid=$(systemctl show -p MainPID "$service" 2>/dev/null | cut -d= -f2)
         if [ -n "$pid" ] && [ "$pid" -gt 0 ]; then
             mem_rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ' || echo 0)
             if [ -n "$mem_rss" ] && [ "$mem_rss" -gt 0 ]; then
@@ -3214,12 +3299,17 @@ health_check_tunnel() {
         reason="port=$listen_port retry_failed=0 mem=${mem_rss}MB"
     fi
 
+    local win_indicator=""
+    if [ -n "$window_type" ]; then
+        win_indicator="[$window_type]"
+    fi
+
     if [ "$status" = "OK" ]; then
-        printf "%-15s ${GREEN}%-6s${NC} %s\n" "$name" "$status" "$reason"
+        printf "%-15s ${GREEN}%-6s${NC} %-10s %s\n" "$name" "$status" "$win_indicator" "$reason"
     elif [ "$status" = "WARN" ]; then
-        printf "%-15s ${YELLOW}%-6s${NC} %s\n" "$name" "$status" "$reason"
+        printf "%-15s ${YELLOW}%-6s${NC} %-10s %s\n" "$name" "$status" "$win_indicator" "$reason"
     else
-        printf "%-15s ${RED}%-6s${NC} %s\n" "$name" "$status" "$reason"
+        printf "%-15s ${RED}%-6s${NC} %-10s %s\n" "$name" "$status" "$win_indicator" "$reason"
     fi
 }
 
