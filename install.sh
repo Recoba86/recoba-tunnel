@@ -3363,10 +3363,10 @@ safe_update_core() {
     print_info "Latest release:     ${CYAN}${latest_tag}${NC}"
     
     # Simple check if already up to date (this handles basic vX.Y.Z matches)
-    local current_cleaned
-    current_cleaned="${installed_ver#v}"; current_cleaned=$(echo "$current_cleaned" | awk '{print $1}')
-    local latest_cleaned
-    latest_cleaned="${latest_tag#v}"
+    local old_ver
+    old_ver=$(extract_recoba_version_from_text "$installed_ver")
+    local current_cleaned="${old_ver#v}"
+    local latest_cleaned="${latest_tag#v}"
     
     if [ "$current_cleaned" = "$latest_cleaned" ]; then
         print_success "Already up to date."
@@ -3397,7 +3397,9 @@ safe_update_core() {
     local new_binary="${temp_dir}/recoba-tunnel"
     
     print_step "Backing up current binary..."
-    local backup_path="${active_binary}.v${current_cleaned}.bak"
+    local timestamp
+    timestamp=$(date +%Y-%m-%d-%H%M%S 2>/dev/null || date +%Y%m%d%H%M%S)
+    local backup_path="${active_binary}.from-${old_ver}.to-${latest_tag}.${timestamp}.bak"
     if ! cp "$active_binary" "$backup_path" 2>/dev/null; then
         print_error "Failed to create backup at $backup_path"
         rm -rf "$temp_dir"
@@ -3431,7 +3433,7 @@ safe_update_core() {
         if cp "$backup_path" "${active_binary}.tmp" 2>/dev/null && chmod +x "${active_binary}.tmp" && mv -f "${active_binary}.tmp" "$active_binary" 2>/dev/null; then
             print_success "Binary restored from backup."
             restart_paqet_services_after_core_update
-            print_info "Rollback complete. System returned to ${current_cleaned}."
+            print_info "Rollback complete. System returned to ${old_ver}."
         else
             print_error "CRITICAL: Rollback failed. Manual intervention required!"
             print_error "Backup is at: $backup_path"
@@ -5908,7 +5910,9 @@ show_core_management_status() {
     local profile_preset
     profile_preset=$(get_current_profile_preset)
     local core_ver
-    core_ver=$(get_installed_paqet_version_text)
+    local raw_ver
+    raw_ver=$(get_installed_paqet_version_text)
+    core_ver=$(extract_recoba_version_from_text "$raw_ver")
 
     echo -e "  ${YELLOW}Core Provider:${NC}  ${CYAN}$(get_core_provider_label "$provider")${NC}"
     echo -e "  ${YELLOW}Core Version:${NC}   ${CYAN}${core_ver}${NC}"
@@ -6187,6 +6191,49 @@ get_installed_paqet_version_text() {
     fi
 }
 
+extract_recoba_version_from_text() {
+    local text="$1"
+    local ver=""
+    local version_line=""
+
+    # Prefer lines containing "version" or "Version" (case-insensitive)
+    version_line=$(echo "$text" | grep -Ei "version" | head -1)
+    if [ -z "$version_line" ]; then
+        version_line=$(echo "$text" | head -1)
+    fi
+
+    # Extract the token matching v[0-9]+\.[0-9]+\.[0-9]+
+    ver=$(echo "$version_line" | grep -oEi 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    if [ -z "$ver" ]; then
+        # Try fallback matching [0-9]+\.[0-9]+\.[0-9]+ and prefixing with 'v'
+        local clean_num=""
+        clean_num=$(echo "$version_line" | grep -oEi '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [ -n "$clean_num" ]; then
+            ver="v$clean_num"
+        fi
+    fi
+
+    # Fallback to scanning the entire text if the version line didn't yield anything
+    if [ -z "$ver" ]; then
+        ver=$(echo "$text" | grep -oEi 'v[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    if [ -z "$ver" ]; then
+        local clean_num=""
+        clean_num=$(echo "$text" | grep -oEi '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        if [ -n "$clean_num" ]; then
+            ver="v$clean_num"
+        fi
+    fi
+
+    if [ -n "$ver" ]; then
+        # Clean any whitespace or unsafe characters
+        ver=$(echo "$ver" | tr -d '[:space:]/\\?*%:|"<>')
+        echo "$ver"
+    else
+        echo "unknown"
+    fi
+}
+
 restart_paqet_services_after_core_update() {
     print_step "Restarting paqet services..."
 
@@ -6235,7 +6282,9 @@ update_paqet_core() {
     print_info "Core provider: ${CYAN}$(get_core_provider_label "$provider")${NC}"
 
     local installed_ver
-    installed_ver=$(get_installed_paqet_version_text)
+    local raw_ver
+    raw_ver=$(get_installed_paqet_version_text)
+    installed_ver=$(extract_recoba_version_from_text "$raw_ver")
     print_info "Installed core: ${CYAN}${installed_ver}${NC}"
 
     local latest_tag
@@ -6440,7 +6489,9 @@ updates_menu() {
         echo ""
 
         local core_ver
-        core_ver=$(get_installed_paqet_version_text)
+        local raw_ver
+        raw_ver=$(get_installed_paqet_version_text)
+        core_ver=$(extract_recoba_version_from_text "$raw_ver")
         local core_provider
         core_provider=$(get_current_core_provider)
         local profile_preset
@@ -7289,7 +7340,9 @@ main() {
             echo -e "${YELLOW}[i] Tip: Install as command with option 'i' to run: ${CYAN}paqet-tunnel${NC}"
         fi
         local core_ver
-        core_ver=$(get_installed_paqet_version_text)
+        local raw_ver
+        raw_ver=$(get_installed_paqet_version_text)
+        core_ver=$(extract_recoba_version_from_text "$raw_ver")
         local header_core_provider
         header_core_provider=$(get_current_core_provider)
         local header_profile_preset

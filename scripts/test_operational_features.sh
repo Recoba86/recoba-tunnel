@@ -247,4 +247,61 @@ assert_contains "$out" "Initiating automatic rollback" "health FAIL after update
 # Restore PAQET_DRY_RUN
 PAQET_DRY_RUN=1
 
+# ---------------------------------------------------------
+# Test: Version Extraction & Backup Naming (v2.1.1)
+# ---------------------------------------------------------
+
+# Test 1: Extract version from multiline output
+multiline_out=$(echo -e "Version:    v2.0.1\nGit Tag:    v2.0.1")
+assert_eq "v2.0.1" "$(extract_recoba_version_from_text "$multiline_out")" "extract from multiline Version: line"
+
+# Test 2: Extract version from single-line output
+assert_eq "v2.0.1" "$(extract_recoba_version_from_text "v2.0.1")" "extract from single line v2.0.1"
+assert_eq "v2.0.1" "$(extract_recoba_version_from_text "2.0.1")" "extract from single line 2.0.1 without v"
+
+# Test 3: Unknown version returns unknown
+assert_eq "unknown" "$(extract_recoba_version_from_text "no version here")" "extract from unknown returns unknown"
+
+# Test 4: Backup filename does not contain spaces, slashes, or unsafe characters
+unsafe_text=$(echo -e "Version:    v/2.0.1?\nGit Commit: *")
+clean_ver=$(extract_recoba_version_from_text "$unsafe_text")
+assert_eq "v2.0.1" "$clean_ver" "extract cleans slashes and question marks"
+
+# Test 5: Safe update uses the parsed version in backup path
+# Let's mock cp to verify the backup path format
+cp() {
+    local src="$1"
+    local dest="$2"
+    echo "CP_MOCK_DEST: $dest"
+    touch "$dest" 2>/dev/null || true
+    return 0
+}
+export -f cp
+
+get_installed_paqet_version_text() {
+    echo -e "Version:    v2.0.1\nGit Tag:    v2.0.1"
+}
+export -f get_installed_paqet_version_text
+
+MOCK_INSTALLED="2.0.1"
+MOCK_LATEST="2.1.1"
+MOCK_DL="ok"
+MOCK_HEALTH="[OK]"
+PAQET_DRY_RUN=0
+
+out=$(safe_update_core)
+assert_contains "$out" "from-v2.0.1.to-v2.1.1." "safe update backup path has from-v2.0.1.to-v2.1.1 format"
+assert_contains "$out" ".bak" "safe update backup path has .bak extension"
+
+# Verify no spaces, slashes or 'Version:' in backup path
+backup_path_line=""
+backup_path_line=$(echo "$out" | grep -Ei "Backup created:" | head -1)
+backup_filename=""
+backup_filename=$(basename "$backup_path_line")
+if [[ "$backup_filename" == *"Version:"* || "$backup_filename" == *" "* ]]; then
+    printf 'FAIL: backup filename contains unsafe characters: %s\n' "$backup_filename" >&2
+    exit 1
+fi
+pass_count=$((pass_count + 1))
+
 printf 'All operational features tests passed (%s assertions).\n' "$pass_count"
